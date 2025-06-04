@@ -464,8 +464,8 @@ def train(hyp, opt, device, tb_writer=None):
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
-                if (best_fitness == fi) and (epoch >= 200):
-                    torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
+                # if (best_fitness == fi) and (epoch >= 200):
+                #     torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
                 if epoch == 0:
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
                 elif ((epoch+1) % 25) == 0:
