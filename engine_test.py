@@ -52,6 +52,7 @@ class TRTModule:
             raise ImportError("TensorRT or PyCUDA is not installed. Please install them to use TensorRT engines.")
 
         self.logger = trt.Logger(trt.Logger.WARNING) # Or INFO for more verbosity
+        trt.init_libnvinfer_plugins(self.logger, namespace="")
         self.engine_path = engine_path
         self.device_str = device_str # For PyTorch tensor placement if needed, PyCUDA handles context
         self.input_name = input_name
