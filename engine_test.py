@@ -62,6 +62,12 @@ class TRTModule:
         with open(self.engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
             self.engine = runtime.deserialize_cuda_engine(f.read())
 
+        # Check if the engine was deserialized successfully
+        if self.engine is None:
+            raise RuntimeError(f"Failed to deserialize the TensorRT engine. This is often caused by a version mismatch. "
+                             f"Ensure the engine was built with the same TensorRT/CUDA/cuDNN versions "
+                             f"used in this environment.")
+
         # Create an execution context
         self.context = self.engine.create_execution_context()
 
@@ -322,6 +328,15 @@ def test(data,
                 temp_logger = trt.Logger(trt.Logger.WARNING)
                 with open(engine_path, "rb") as f_eng, trt.Runtime(temp_logger) as temp_runtime:
                     temp_engine = temp_runtime.deserialize_cuda_engine(f_eng.read())
+                
+                # *** ADDED ERROR HANDLING HERE ***
+                if temp_engine is None:
+                    raise RuntimeError(f"Failed to deserialize the TensorRT engine from {engine_path}. "
+                                     f"This is often caused by a version mismatch. \n"
+                                     f"Please REBUILD the engine in the current environment (e.g., this Kaggle notebook) "
+                                     f"with the same TensorRT/CUDA/cuDNN versions. "
+                                     f"TensorRT engines are NOT portable between different environments.")
+                
                 trt_engine_output_names = [temp_engine.get_binding_name(i) for i in range(temp_engine.num_bindings) if not temp_engine.binding_is_input(i)]
                 if not trt_engine_output_names:
                     raise ValueError("Could not automatically determine output names from TensorRT engine.")
