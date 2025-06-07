@@ -222,7 +222,11 @@ class TRTModule:
             expected_elements_per_item = num_predictions * num_params
             # Calculate effective batch size from total elements / elements_per_item
             # This assumes raw_output_np is trimmed to actual output data.
-            effective_batch_size = raw_output_np.size // expected_elements_per_item
+            if expected_elements_per_item > 0:
+                effective_batch_size = raw_output_np.size // expected_elements_per_item
+            else:
+                effective_batch_size = 0
+                
             if effective_batch_size != current_batch_size:
                  print(f"Warning: Mismatch in effective batch size ({effective_batch_size}) and input batch size ({current_batch_size}). Using input batch size for reshaping.")
                  effective_batch_size = current_batch_size # Trust input batch size
@@ -314,24 +318,7 @@ def test(data,
             if trt_output_names:
                 trt_engine_output_names = [name.strip() for name in trt_output_names.split(',')]
             else:
-                # Default or try to infer if possible (e.g., common YOLO output name)
-                # This is a placeholder; robust inference of output names is hard.
-                # Usually, the user should provide this.
-                print(f"{colorstr('TensorRT Warning: ')}--trt-output-names not specified. Assuming single output named 'output' or similar based on engine.")
-                # Attempt to get output names from a dummy TRTModule instance if not provided (complex)
-                # For now, let's assume a common default if not provided, e.g. 'output' or first non-input binding.
-                # This is a simplification. User should provide this for reliability.
-                # A common default for many converted YOLO models is 'output' or 'detections'.
-                # For now, let's assume the TRTModule will try to use the first non-input binding if not specified.
-                # It's better to require the user to specify it.
-                # Forcing user to specify for now if more than one output expected by NMS.
-                # If only one output is expected by NMS, TRTModule will use its first output.
-                # Let's assume the TRTModule handles finding the primary output if trt_engine_output_names is None.
-                # The TRTModule now takes output_names_from_engine.
-                # We need to get these names by inspecting the engine if not provided by user.
-                # This is an advanced step, for now, require user to provide it or assume a default like ['output0']
-                # For simplicity, if not provided, TRTModule will use all non-input bindings.
-                # The __call__ method then uses the *first* of these for NMS.
+                print(f"{colorstr('TensorRT Warning: ')}--trt-output-names not specified. Attempting to infer from engine.")
                 temp_logger = trt.Logger(trt.Logger.WARNING)
                 with open(engine_path, "rb") as f_eng, trt.Runtime(temp_logger) as temp_runtime:
                     temp_engine = temp_runtime.deserialize_cuda_engine(f_eng.read())
@@ -345,9 +332,7 @@ def test(data,
             gs = max(int(model.stride.max()), 32)
             imgsz = check_img_size(imgsz, s=gs)
             # Determine if input should be half precision for TRT engine
-            # This is a heuristic. Ideally, engine metadata would specify input type.
             half_input_for_trt = "FP16" in engine_path.upper() or "HALF" in engine_path.upper()
-            # `half` variable controls preprocessing before model call
             half = half_input_for_trt
             if half:
                 print(f"{colorstr('TensorRT: ')}Input data will be prepared as FP16 for the engine.")
@@ -371,15 +356,12 @@ def test(data,
 
     # --- Dataloader Setup ---
     if not training:
-        # Warmup for PyTorch models
         if device.type != 'cpu' and weights and not engine_path:
-            # Create a dummy input tensor with the correct type (half or float)
             dummy_input_type = torch.half if half else torch.float
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type(dummy_input_type)) # run once
 
         task = opt.task if hasattr(opt, 'task') and opt.task in ('train', 'val', 'test') else 'val'
-        # Ensure 'rect' is available in opt for create_dataloader
-        rect_val = opt.rect if hasattr(opt, 'rect') else True # Default to True if not in opt (e.g. when called from train.py)
+        rect_val = opt.rect if hasattr(opt, 'rect') else True 
         dataloader = create_dataloader(data_cfg[task], imgsz, batch_size, gs, opt, pad=0.5, rect=rect_val,
                                        prefix=colorstr(f'{task}: '))[0]
 
@@ -389,7 +371,6 @@ def test(data,
     
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
-    # Use names from the loaded model (TRTModule or PyTorch model)
     names = model.names if hasattr(model, 'names') else class_names_from_data
     coco91class = coco80_to_coco91_class()
     s_format = '%20s' + '%12s' * 6
@@ -397,14 +378,12 @@ def test(data,
     p_metric, r_metric, f1_metric, mp_metric, mr_metric, map50_metric, map_metric, t0_inf, t1_nms = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap_all, ap_class_indices, wandb_images = [], [], [], [], []
-    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
+    iouv = torch.linspace(0.5, 0.95, 10).to(device)
     niou = iouv.numel()
 
     # --- Main Evaluation Loop ---
     for batch_i, (img_batch, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s_header)):
         img_batch = img_batch.to(device, non_blocking=True)
-        # Preprocess image: uint8 to fp16/32, 0 - 255 to 0.0 - 1.0
-        # `half` is determined by engine type (if TRT) or half_precision flag (if PyTorch)
         img_processed = img_batch.half() if half else img_batch.float()
         img_processed /= 255.0
         
@@ -412,36 +391,26 @@ def test(data,
         nb, _, height, width = img_processed.shape
 
         with torch.no_grad():
-            # Inference
             t_inf_start = time_synchronized()
-            out_raw, train_out = model(img_processed, augment=augment) # train_out will be None for TRTModule
+            out_raw, train_out = model(img_processed, augment=augment)
             t0_inf += time_synchronized() - t_inf_start
 
-            # Loss computation (only if PyTorch model and compute_loss is provided)
             if compute_loss and train_out is not None:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3] # box, obj, cls
-            elif compute_loss and engine_path and batch_i == 0: # First batch with TRT
+                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]
+            elif compute_loss and engine_path and batch_i == 0:
                 print(f"{colorstr('TensorRT: ')}Skipping loss computation as 'train_out' is not available from engine.")
 
-
-            # Non-Maximum Suppression (NMS)
-            targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device) # to pixels
-            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else [] # for autolabelling
+            targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)
+            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []
             
             t_nms_start = time_synchronized()
-            # Ensure out_raw is not None before passing to NMS
-            if out_raw is None and not engine_path : # Should not happen for PyTorch models unless error
-                 print(f"Error: Raw output from PyTorch model is None at batch {batch_i}. Skipping NMS.")
-                 out_nms = [torch.empty(0,6).to(device)] * nb # Create empty list of tensors
-            elif out_raw is None and engine_path:
-                 print(f"Error: Raw output from TensorRT model is None at batch {batch_i}. Skipping NMS.")
+            if out_raw is None:
+                 print(f"Warning: Raw output from model is None at batch {batch_i}. Skipping NMS.")
                  out_nms = [torch.empty(0,6).to(device)] * nb
             else:
                  out_nms = non_max_suppression(out_raw, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
             t1_nms += time_synchronized() - t_nms_start
 
-
-        # Statistics per image
         for si, pred in enumerate(out_nms):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
@@ -455,60 +424,53 @@ def test(data,
                 continue
 
             predn = pred.clone()
-            scale_coords(img_processed[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1]) # native-space pred
+            scale_coords(img_processed[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])
 
-            # Save predictions to text file
             if save_txt:
-                gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]] # normalization gain whwh
+                gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]
                 for *xyxy, conf, cls_id in predn.tolist():
-                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist() # normalized xywh
+                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                     line = (cls_id, *xywh, conf) if save_conf else (cls_id, *xywh)
                     with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
                         f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-            # W&B logging
-            # ... (wandb logging code can be placed here if needed) ...
-
-            # COCO JSON predictions
             if save_json:
                 image_id = int(path.stem) if path.stem.isnumeric() else path.stem
                 box = xyxy2xywh(predn[:, :4])
-                box[:, :2] -= box[:, 2:] / 2 # xy center to top-left corner
+                box[:, :2] -= box[:, 2:] / 2
                 for p_item, b_item in zip(pred.tolist(), box.tolist()):
                     jdict.append({'image_id': image_id,
                                   'category_id': coco91class[int(p_item[5])] if is_coco else int(p_item[5]),
                                   'bbox': [round(x, 3) for x in b_item],
                                   'score': round(p_item[4], 5)})
 
-            # Compute correctness for AP calculation
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
             if nl:
                 detected = []
                 tcls_tensor = labels[:, 0]
-                tbox = xywh2xyxy(labels[:, 1:5]) # Target boxes in xyxy format
-                scale_coords(img_processed[si].shape[1:], tbox, shapes[si][0], shapes[si][1]) # native-space labels
+                tbox = xywh2xyxy(labels[:, 1:5])
+                scale_coords(img_processed[si].shape[1:], tbox, shapes[si][0], shapes[si][1])
                 
                 if plots:
                     confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
 
                 for cls_idx in torch.unique(tcls_tensor):
-                    ti = (cls_idx == tcls_tensor).nonzero(as_tuple=False).view(-1) # Target indices for this class
-                    pi = (cls_idx == pred[:, 5]).nonzero(as_tuple=False).view(-1) # Prediction indices for this class
+                    ti = (cls_idx == tcls_tensor).nonzero(as_tuple=False).view(-1)
+                    pi = (cls_idx == pred[:, 5]).nonzero(as_tuple=False).view(-1)
 
                     if pi.shape[0]:
-                        ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1) # Best IoUs for these predictions
+                        ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)
                         detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False): # Check against first IoU threshold (0.5)
-                            d = ti[i[j]] # Detected target index
+                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                            d = ti[i[j]]
                             if d.item() not in detected_set:
                                 detected_set.add(d.item())
                                 detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv # Check against all IoU thresholds
-                                if len(detected) == nl: # All targets found
+                                correct[pi[j]] = ious[j] > iouv
+                                if len(detected) == nl:
                                     break
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
-        # Plot images for first few batches
         if plots and batch_i < 3:
             f_labels = save_dir / f'test_batch{batch_i}_labels.jpg'
             Thread(target=plot_images, args=(img_batch, targets, paths, f_labels, names), daemon=True).start()
@@ -519,27 +481,21 @@ def test(data,
     stats = [np.concatenate(x, 0) for x in zip(*stats)] if len(stats) else []
     if len(stats) and stats[0].any():
         p_metric, r_metric, ap_all, f1_metric, ap_class_indices = ap_per_class(*stats, plot=plots, v5_metric=v5_metric, save_dir=save_dir, names=names)
-        ap50_metric, ap_metric = ap_all[:, 0], ap_all.mean(1) # AP@0.5, AP@0.5:0.95
+        ap50_metric, ap_metric = ap_all[:, 0], ap_all.mean(1)
         mp_metric, mr_metric, map50_metric, map_metric = p_metric.mean(), r_metric.mean(), ap50_metric.mean(), ap_metric.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc) # Number of targets per class
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)
     else:
         nt = torch.zeros(1)
-        # Set metrics to zero if no stats or no detections
         mp_metric, mr_metric, map50_metric, map_metric = 0., 0., 0., 0.
         ap50_metric, ap_metric = np.zeros(nc), np.zeros(nc)
-        ap_class_indices = list(range(nc)) # Default class indices
+        ap_class_indices = list(range(nc))
 
-
-    # Print results
     print(s_format % ('all', seen, nt.sum(), mp_metric, mr_metric, map50_metric, map_metric))
 
-    # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats) and stats[0].any():
         for i, c_idx in enumerate(ap_class_indices):
             print(s_format % (names[c_idx], seen, nt[c_idx], p_metric[i], r_metric[i], ap50_metric[i], ap_metric[i]))
 
-
-    # Print speeds
     t_total_inf_ms = t0_inf / seen * 1E3 if seen > 0 else 0
     t_total_nms_ms = t1_nms / seen * 1E3 if seen > 0 else 0
     t_total_combined_ms = (t0_inf + t1_nms) / seen * 1E3 if seen > 0 else 0
@@ -547,15 +503,10 @@ def test(data,
     if not training:
         print('Speed: %.1fms inference, %.1fms NMS, %.1fms total per %gx%g image at batch-size %g' % speed_stats)
 
-
-    # Plots
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        # ... (wandb logging for plots if used) ...
 
-    # Save JSON for COCO evaluation
     if save_json and len(jdict):
-        # Determine weights/engine stem for filename
         if weights and isinstance(weights, list) and weights[0]:
             w_stem = Path(weights[0]).stem
         elif engine_path:
@@ -563,12 +514,9 @@ def test(data,
         else:
             w_stem = 'model'
 
-        # Construct path to COCO annotations JSON
-        # Default to standard COCO val2017 annotations path structure
-        # User might need to adjust this if their dataset structure is different
         anno_path_str = str(data_cfg.get('val', '')).replace('images', 'annotations').replace('val2017.txt', 'instances_val2017.json')
-        if not Path(anno_path_str).exists(): # Fallback if simple replace doesn't work
-            base_path = Path(data_cfg.get('path', '.')) # Get 'path' from data.yaml
+        if not Path(anno_path_str).exists():
+            base_path = Path(data_cfg.get('path', '.'))
             anno_path_str = str(base_path / 'annotations' / 'instances_val2017.json')
         
         pred_json_path = str(save_dir / f"{w_stem}_predictions.json")
@@ -584,12 +532,10 @@ def test(data,
             pred = anno.loadRes(pred_json_path)
             eval = COCOeval(anno, pred, 'bbox')
             
-            if is_coco: # Filter image IDs if it's COCO dataset
-                # Try to get img_ids from dataloader if available (more robust)
+            if is_coco:
                 if hasattr(dataloader.dataset, 'img_files'):
                      img_ids_to_eval = [int(Path(x).stem) for x in dataloader.dataset.img_files]
                      eval.params.imgIds = img_ids_to_eval
-                # Fallback: if 'val_img_ids.txt' is specified in data_cfg (less common)
                 elif 'val_img_ids' in data_cfg and Path(data_cfg['val_img_ids']).exists():
                     with open(data_cfg['val_img_ids'], 'r') as f_img_ids:
                         eval.params.imgIds = [int(line.strip()) for line in f_img_ids]
@@ -597,25 +543,23 @@ def test(data,
             eval.evaluate()
             eval.accumulate()
             eval.summarize()
-            map_metric, map50_metric = eval.stats[:2] # Update results (mAP@0.5:0.95, mAP@0.5)
+            map_metric, map50_metric = eval.stats[:2]
         except Exception as e:
             print(f'{colorstr("pycocotools error: ")}pycocotools unable to run: {e}')
             print(f"Ensure annotation file path is correct: {anno_path_str}")
 
-
-    # Return results
-    if not isinstance(model, TRTModule) and hasattr(model, 'float'): # PyTorch model
-        model.float() # Convert back to float for potential further training/use
+    if not isinstance(model, TRTModule) and hasattr(model, 'float'):
+        model.float()
 
     if not training:
         s_save = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         print(f"Results saved to {save_dir}{s_save}")
     
-    maps_per_class = np.zeros(nc) + map_metric # Default to overall mAP
-    if len(stats) and stats[0].any() and len(ap_all) > 0 : # Ensure ap_all is populated
+    maps_per_class = np.zeros(nc) + map_metric
+    if len(stats) and stats[0].any() and len(ap_all) > 0 :
         for i, c_idx in enumerate(ap_class_indices):
-            if i < len(ap_all): # Safety check for index bounds
-                 maps_per_class[c_idx] = ap_all[i].mean() # ap_all is [classes, IoUs], so take mean over IoUs for mAP@0.5:0.95 per class
+            if i < len(ap_all):
+                 maps_per_class[c_idx] = ap_all[i].mean()
 
     final_loss = (loss.cpu().numpy() / len(dataloader)).tolist() if len(dataloader) > 0 else [0,0,0]
     return (mp_metric, mr_metric, map50_metric, map_metric, *final_loss), maps_per_class, speed_stats
@@ -623,8 +567,8 @@ def test(data,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--weights', nargs='+', type=str, default=None, help='model.pt path(s)')
-    parser.add_argument('--engine', type=str, default=None, help='TensorRT .engine file path')
+    parser.add_argument('--weights', nargs='+', type=str, default=None, help='model.pt path(s) or model.engine path(s)')
+    parser.add_argument('--engine', type=str, default=None, help='TensorRT .engine file path (takes priority over --weights if both provided)')
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='*.yaml path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
@@ -649,24 +593,46 @@ if __name__ == '__main__':
     parser.add_argument('--model-stride', type=int, default=32, help='Max stride of the model (needed for TRT engine)')
     parser.add_argument('--trt-input-name', type=str, default='images', help='Input node name of the TRT engine')
     parser.add_argument('--trt-output-names', type=str, default=None, help="Comma-separated output node names of the TRT engine (e.g., 'output0,output1')")
-    parser.add_argument('--rect', action='store_true', help='rectangular inference') # Added for dataloader consistency
+    parser.add_argument('--rect', action='store_true', help='rectangular inference')
 
     opt = parser.parse_args()
 
-    # Input validation
+    # --- Robust Argument Handling ---
+    # This logic handles the case where user passes a .engine file via --weights
+    if opt.weights:
+        engine_files_in_weights = [w for w in opt.weights if Path(w).suffix.lower() == '.engine']
+        if engine_files_in_weights:
+            if len(engine_files_in_weights) > 1:
+                print(f"{colorstr('Warning: ')}Multiple .engine files found in --weights. Using the first one: {engine_files_in_weights[0]}")
+
+            # If an engine is already specified via --engine, give a warning and prioritize --engine argument.
+            if opt.engine and opt.engine != engine_files_in_weights[0]:
+                 print(f"{colorstr('Warning: ')}TensorRT engine specified via both --engine ({opt.engine}) and --weights ({engine_files_in_weights[0]}). "
+                       f"Prioritizing the one from --engine argument: {opt.engine}")
+            else:
+                 # Move the engine file from weights to the engine argument
+                 opt.engine = engine_files_in_weights[0]
+
+            # Remove engine files from weights list
+            opt.weights = [w for w in opt.weights if Path(w).suffix.lower() != '.engine']
+            if not opt.weights: # If the list becomes empty
+                opt.weights = None
+    
+    # --- Final Input Validation ---
     if not opt.weights and not opt.engine:
-        raise ValueError("Either --weights (for PyTorch model) or --engine (for TensorRT model) must be specified.")
+        raise ValueError("After parsing, no valid --weights (for PyTorch model) or --engine (for TensorRT model) was found.")
+    
     if opt.weights and opt.engine:
-        print(f"{colorstr('Warning: ')}Both --weights and --engine are specified. Prioritizing --engine.")
-        opt.weights = None # Prioritize engine
+        print(f"{colorstr('Warning: ')}Both a PyTorch model ({opt.weights}) and a TensorRT engine ({opt.engine}) are specified. "
+              "The script will prioritize the TensorRT engine. The PyTorch model will be ignored.")
+        opt.weights = None
 
     opt.save_json |= opt.data.endswith('coco.yaml') if opt.data else False
-    opt.data = check_file(opt.data)  # check file
+    opt.data = check_file(opt.data)
     print(opt)
-    # check_requirements() # Can be conditional or ensure TRT/PyCUDA are handled
 
     # --- Main Execution Logic ---
-    if opt.task in ('train', 'val', 'test'):  # run normally
+    if opt.task in ('train', 'val', 'test'):
         test(opt.data,
              opt.weights,
              opt.batch_size,
@@ -680,8 +646,8 @@ if __name__ == '__main__':
              save_txt=opt.save_txt | opt.save_hybrid,
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
-             trace=not opt.no_trace and not opt.engine, # Disable trace for engine
-             half_precision=opt.half_precision, # Pass this to test function
+             trace=not opt.no_trace and not opt.engine,
+             half_precision=opt.half_precision,
              v5_metric=opt.v5_metric,
              engine_path=opt.engine,
              model_stride=opt.model_stride,
@@ -689,13 +655,12 @@ if __name__ == '__main__':
              trt_output_names=opt.trt_output_names
              )
 
-    elif opt.task == 'speed':  # speed benchmarks
-        # Iterate over weights (if provided) or the single engine (if provided)
+    elif opt.task == 'speed':
         model_paths = opt.weights if opt.weights else ([opt.engine] if opt.engine else [])
         for model_p in model_paths:
-            current_weights = [model_p] if Path(model_p).suffix == '.pt' else None
-            current_engine = model_p if Path(model_p).suffix == '.engine' else None
-            if not current_weights and not current_engine: continue # Skip if not a valid model path
+            current_weights = [model_p] if Path(model_p).suffix.lower() == '.pt' else None
+            current_engine = model_p if Path(model_p).suffix.lower() == '.engine' else None
+            if not current_weights and not current_engine: continue
 
             test(opt.data, current_weights, opt.batch_size, opt.img_size, 0.25, 0.45,
                  save_json=False, plots=False, v5_metric=opt.v5_metric,
@@ -703,37 +668,32 @@ if __name__ == '__main__':
                  trt_input_name=opt.trt_input_name, trt_output_names=opt.trt_output_names,
                  half_precision=opt.half_precision)
 
-
-    elif opt.task == 'study':  # run over a range of settings and save/plot
-        # This task needs careful adaptation for TensorRT engines, as engines are typically built for a fixed imgsz.
-        # Studying different imgsz with a single TRT engine might not be meaningful unless the engine supports dynamic input sizes.
-        print(f"{colorstr('Warning: ')}'study' task with TensorRT engines requires the engine to support dynamic image sizes "
-              "or multiple engines for different sizes. This example assumes dynamic size support if an engine is used.")
+    elif opt.task == 'study':
+        print(f"{colorstr('Warning: ')}'study' task requires an engine with dynamic image size support if a .engine file is used.")
         
-        x_img_sizes = list(range(256, 1536 + 128, 128))  # x axis (image sizes)
+        x_img_sizes = list(range(256, 1536 + 128, 128))
         model_paths_for_study = opt.weights if opt.weights else ([opt.engine] if opt.engine else [])
 
         for model_p_study in model_paths_for_study:
-            current_weights_study = [model_p_study] if Path(model_p_study).suffix == '.pt' else None
-            current_engine_study = model_p_study if Path(model_p_study).suffix == '.engine' else None
+            current_weights_study = [model_p_study] if Path(model_p_study).suffix.lower() == '.pt' else None
+            current_engine_study = model_p_study if Path(model_p_study).suffix.lower() == '.engine' else None
             if not current_weights_study and not current_engine_study: continue
 
             study_filename_stem = Path(opt.data).stem + '_' + Path(model_p_study).stem
             study_results_file = f'study_{study_filename_stem}.txt'
             
-            y_results = []  # y axis
-            for current_imgsz in x_img_sizes:  # Iterate over image sizes
+            y_results = []
+            for current_imgsz in x_img_sizes:
                 print(f'\nRunning {study_results_file} point {current_imgsz}...')
-                # Ensure half_precision is passed correctly
                 results, _, speed = test(opt.data, current_weights_study, opt.batch_size, current_imgsz,
                                          opt.conf_thres, opt.iou_thres, opt.save_json,
                                          plots=False, v5_metric=opt.v5_metric,
                                          engine_path=current_engine_study, model_stride=opt.model_stride,
                                          trt_input_name=opt.trt_input_name, trt_output_names=opt.trt_output_names,
                                          half_precision=opt.half_precision)
-                y_results.append(results + speed) # results tuple + speed tuple
-            np.savetxt(study_results_file, y_results, fmt='%10.4g')  # save
+                y_results.append(results + speed)
+            np.savetxt(study_results_file, y_results, fmt='%10.4g')
         
-        if model_paths_for_study: # Only zip and plot if studies were run
+        if model_paths_for_study:
             os.system('zip -r study.zip study_*.txt')
-            plot_study_txt(x=x_img_sizes)  # plot (ensure plot_study_txt can handle the new result format)
+            plot_study_txt(x=x_img_sizes)
